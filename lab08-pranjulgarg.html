@@ -1,0 +1,453 @@
+---
+title: 'Module 05: Lab 02'
+subtitle: Regression Modeling on Employment Data
+author:
+  - name: Pranjul Garg
+    affiliations:
+      - id: BU
+        name: Boston University
+        city: Boston
+        state: MA
+number-sections: true
+date: '2025-04-14'
+format:
+  html:
+    theme: cerulean
+    toc: true
+    toc-depth: 2
+date-modified: today
+date-format: long
+execute:
+  echo: false
+  eval: false
+  freeze: auto
+jupyter: python3
+---
+
+# Objectives {.unnumbered}
+
+1. Use **PySpark** to process the Lightcast dataset.
+2. Engineer features from structured columns for salary prediction.
+3. Train **Linear Regression model**.
+4. Evaluate models using **RMSE** and **R²**.
+5. Visualize predictions using diagnostic plots.
+6. Push work to GitHub and submit the repository link.
+
+
+```{python}
+#import gdown
+#url = "https://drive.google.com/uc?id=1V2GCHGt2dkFGqVBeoUFckU4IhUgk4ocQ"
+#gdown.download(url, "lightcast_data.csv", quiet=False)
+```
+
+
+# Load the Dataset
+
+```{python}
+#| eval: true
+#| echo: true
+#| fig-align: center
+from pyspark.sql import SparkSession
+import pandas as pd
+import plotly.express as px
+import plotly.io as pio
+pio.renderers.default = "notebook"
+
+spark = SparkSession.builder.appName("LightcastData").getOrCreate()
+
+
+df = spark.read.option("header", "true").option("inferSchema", "true").option("multiLine","true").option("escape", "\"").csv("./data/lightcast_data.csv")
+
+# Show Schema and Sample Data
+#print("---This is Diagnostic check, No need to print it in the final doc---")
+
+#df.printSchema() # comment this line when rendering the submission
+#df.show(5)
+```
+
+# Feature Engineering
+
+```{python}
+#| eval: true
+#| echo: true
+#| fig-align: center
+from pyspark.sql.functions import col
+from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler
+from pyspark.ml import Pipeline
+from pyspark.sql.functions import log1p
+
+#Drop rows with nulls in required columns
+df = df.dropna(subset=["SALARY", "DURATION", "MIN_YEARS_EXPERIENCE", "EMPLOYMENT_TYPE_NAME"])
+df = df.withColumn("SALARY", df["SALARY"])
+
+# Define columns
+categorical_cols = ["EMPLOYMENT_TYPE_NAME"]
+numerical_cols = ["DURATION","MIN_YEARS_EXPERIENCE"]
+
+#Index and encode categoricals
+indexers = [
+    StringIndexer(inputCol=col, outputCol=f"{col}_idx", handleInvalid='skip')
+    for col in categorical_cols
+]
+
+encoders = [
+    OneHotEncoder(inputCol=f"{col}_idx", outputCol=f"{col}_vec", dropLast=True)
+    for col in categorical_cols
+]
+
+
+assembler = VectorAssembler(
+    inputCols=numerical_cols + [f"{col}_vec" for col in categorical_cols],
+    outputCol="features"
+)
+
+# Build pipeline
+pipeline = Pipeline(stages=indexers + encoders + [assembler])
+
+pipeline_model = pipeline.fit(df)
+data = pipeline_model.transform(df)
+
+data.select("features", "SALARY").show(5, False)
+```
+
+- The **Continuous Variables** which I have selected are: **"DURATION", "MIN_YEARS_EXPERIENCE"** 
+
+- The **Categorical Variables** which I have selected are: **"EMPLOYMENT_TYPE_NAME"**
+
+# Train/Test Split
+
+```{python}
+#| eval: true
+#| echo: true
+#| fig-align: center
+train_data, test_data = data.randomSplit([0.6, 0.4], seed=801)  #U39153801
+print((train_data.count(), len(train_data.columns)))
+print((test_data.count(), len(test_data.columns)))
+```
+
+- I have used the **SEED Value as 801**, which is the last three digits of my **BU ID: U39153801**
+
+- We've got millions of rows, even 60% can be more than enough for training. Dropping to 60/40 still leaves us a massive training set, while giving you an even larger test pool.
+
+# Linear Regression
+
+```{python}
+#| eval: true
+#| echo: true
+from pyspark.ml.regression import LinearRegression
+from pyspark.ml.evaluation import RegressionEvaluator
+import pandas as pd
+
+
+feature_names = assembler.getInputCols()
+lr = LinearRegression(featuresCol="features", labelCol="SALARY", regParam=0.1)
+lr_model = lr.fit(train_data)
+predictions = lr_model.transform(test_data)
+df_pred = predictions.select("prediction", "SALARY").toPandas()
+
+evaluator_r2 = RegressionEvaluator(labelCol="SALARY", predictionCol="prediction", metricName="r2")
+evaluator_rmse = RegressionEvaluator(labelCol="SALARY", predictionCol="prediction", metricName="rmse")
+evaluator_mae = RegressionEvaluator(labelCol="SALARY", predictionCol="prediction", metricName="mae")
+
+
+r2 = evaluator_r2.evaluate(predictions)
+rmse = evaluator_rmse.evaluate(predictions)
+mae = evaluator_mae.evaluate(predictions)
+
+print("\n--- Model Performance on Test Data ---")
+print(f"R²:   {r2:.4f}")
+print(f"RMSE: {rmse:.2f}")
+print(f"MAE:  {mae:.2f}")
+
+summary = lr_model.summary
+
+```
+
+- An **R² of 0.26** means the linear model is only explaining about a quarter of the variation in salaries—basically it’s under‑fitting.
+
+- An **RMSE of $36160.20** tells us the predictions typically stray from the true salary, while an **MAE of $28121.86**is the average absolute miss.
+
+- This baseline gives us a room to improve—try richer features, non‑linear terms, or tree‑based methods to tighten up that fit.
+
+## Generalized Linear Regression Summary
+
+```{python}
+#| eval: true
+#| echo: true
+#| fig-align: center
+
+from pyspark.ml.regression import GeneralizedLinearRegression
+from tabulate import tabulate
+import numpy as np
+import pandas as pd
+
+glr = GeneralizedLinearRegression(
+    featuresCol="features",
+    labelCol="SALARY",
+    family="gaussian",
+    link="identity",
+    regParam=0.1    
+)
+glr_model = glr.fit(train_data)
+summary   = glr_model.summary
+
+# 2) Pull raw stats
+intercept        = glr_model.intercept
+feature_coefs    = glr_model.coefficients.toArray()  # length = num_features
+
+all_se           = np.array(summary.coefficientStandardErrors)  # includes intercept
+all_t            = np.array(summary.tValues)
+all_p            = np.array(summary.pValues)
+
+# 3) Slice intercept vs features
+intercept_se     = all_se[0]
+intercept_t      = all_t[0]
+intercept_p      = all_p[0]
+
+feat_se          = all_se[1:]
+feat_t           = all_t[1:]
+feat_p           = all_p[1:]
+
+# 4) Recover flat feature names from your VectorAssembler metadata
+meta  = data.schema["features"].metadata
+attrs = []
+for _, alist in meta["ml_attr"]["attrs"].items():
+    attrs.extend(alist)
+feat_names = [a["name"] for a in attrs]
+
+assert len(feat_names) == len(feature_coefs), "Feature name/coef length mismatch!"
+
+# 5) Pack into lists (intercept first)
+features  = ["intercept"] + feat_names
+coefs     = [intercept] + feature_coefs.tolist()
+std_errs  = all_se.tolist()
+t_vals    = all_t.tolist()
+p_vals    = all_p.tolist()
+
+print(f"Length of features: {len(features)}")
+print(f"Length of coefs:    {len(coefs)}")
+print(f"Length of se:       {len(std_errs)}")
+print(f"Length of tvals:    {len(t_vals)}")
+print(f"Length of pvals:    {len(p_vals)}\n")
+
+
+```
+
+```{python}
+#| eval: true
+#| echo: true
+#| fig-align: center
+# 6) Compute 95% CIs
+z         = 1.96
+ci_lower  = [c - z*se for c, se in zip(coefs, std_errs)]
+ci_upper  = [c + z*se for c, se in zip(coefs, std_errs)]
+
+# 7) Build the summary DataFrame
+df_glr_summary = pd.DataFrame({
+    "Feature":     features,
+    "Coefficient": coefs,
+    "Std Error":   std_errs,
+    "T-Value":     t_vals,
+    "P-Value":     p_vals,
+    "CI Lower":    ci_lower,
+    "CI Upper":    ci_upper
+})
+
+print("=== Generalized Linear Regression (GLR) Summary ===")
+print(tabulate(df_glr_summary, headers="keys", tablefmt="pretty", floatfmt=".4f"))
+
+df_glr_summary.to_csv("_output/glr_summary.csv", index=False)
+```
+
+- The **intercept of $77.6 k** is the model’s baseline salary when all predictors are zero, but its high **p‑value (0.66)** means it isn’t statistically distinguishable from zero in context.
+- DURATION has a tiny negative coefficient **(–$12 per unit)** and is essentially null (p≫0.05).
+- MIN_YEARS_EXPERIENCE adds about **$6.8 k per additional year**, with a borderline p‑value (≈0.10), suggesting experience may matter but needs more data to confirm.
+- Neither full‑time (+$5.4 k) nor part‑time (+$2.7 k) status is significant (p≫0.05), so employment type isn’t a reliable salary predictor here.
+
+# Diagnostic Plot
+
+Diagnostic plots are essential for evaluating the performance of regression models. In this section, we will create several diagnostic plots to assess the linear regression model's assumptions and performance. There are four (2*2 grid) main plots we will create, you can use `seaborn` or `matplotlib` for this:
+
+1. **Predicted vs Actual Plot**
+2. **Residuals vs Predicted Plot**
+3. **Histogram of Residuals**
+4. **QQ Plot of Residuals**
+
+```{python}
+#| eval: true
+#| echo: true
+#| fig-align: center
+import matplotlib.pyplot as plt
+import seaborn as sns
+import scipy.stats as stats
+import numpy as np
+import pandas as pd
+
+# Convert predictions to pandas
+df_pred = summary.predictions.select("prediction", "SALARY").toPandas()
+
+# Residuals and fitted values
+df_pred["residuals"] = df_pred["SALARY"] - df_pred["prediction"]
+df_pred["fitted"] = df_pred["prediction"]
+
+# Standardized residuals
+res_mean = df_pred["residuals"].mean()
+res_std = df_pred["residuals"].std()
+df_pred["std_residuals"] = (df_pred["residuals"] - res_mean) / res_std
+df_pred["sqrt_std_resid"] = np.sqrt(np.abs(df_pred["std_residuals"]))
+
+# Plot layout
+plt.figure(figsize=(16, 12))
+sns.set_theme(style="whitegrid")
+
+# 1. Residuals vs Fitted
+plt.subplot(2, 2, 1)
+sns.scatterplot(x="fitted", y="residuals", data=df_pred, alpha=0.6)
+plt.axhline(0, linestyle="--", color="red")
+plt.title("Residuals vs Fitted")
+plt.xlabel("Fitted Salary")
+plt.ylabel("Residuals")
+
+# 2. Normal Q-Q
+plt.subplot(2, 2, 2)
+stats.probplot(df_pred["residuals"], dist="norm", plot=plt)
+plt.title("Normal Q-Q")
+
+# 3. Scale-Location Plot
+plt.subplot(2, 2, 3)
+sns.scatterplot(x="fitted", y="sqrt_std_resid", data=df_pred, alpha=0.6)
+plt.title("Scale-Location")
+plt.xlabel("Fitted Salary")
+plt.ylabel("√|Standardized Residuals|")
+
+# 4. Standardized Residuals vs Fitted
+plt.subplot(2, 2, 4)
+sns.scatterplot(x="fitted", y="std_residuals", data=df_pred, alpha=0.6)
+plt.axhline(0, linestyle="--", color="red")
+plt.title("Standardized Residuals vs Fitted")
+plt.xlabel("Fitted Salary")
+plt.ylabel("Standardized Residuals")
+
+# Output
+plt.tight_layout()
+plt.savefig("_output/glr_diagnostic_classic.png")
+plt.show()
+```
+
+- **Linearity & Fit:** The Residuals vs Fitted plot shows points randomly scattered around zero with no obvious curve—so the linear specification is doing OK overall, though the residual spread does creep up at higher salaries.
+- **Normality Check:** The QQ‐plot bows out at both ends, signaling heavier‐tailed errors than a perfect normal; we have got a few more extreme deviations than Gauss would like.
+- **Homoscedasticity & Outliers**: The Scale–Location plot’s slight funnel shape hints at non‑constant variance (variance grows with fitted values), and the standardized residuals mostly sit within ±3 with only a handful of mild outliers—no catastrophic leverage points, but room for variance‐stabilizing fixes.
+
+# Evaluation
+
+```{python}
+#| eval: true
+#| echo: true
+#| fig-align: center
+
+from pyspark.ml.evaluation import RegressionEvaluator
+from pyspark.sql.functions import col, pow, sqrt, avg
+import numpy as np
+
+# Predict on test set
+pred_glr = lr_model.transform(test_data)
+
+# 1. R² Evaluation
+r2_eval = RegressionEvaluator(labelCol="SALARY", predictionCol="prediction", metricName="r2")
+r2 = r2_eval.evaluate(pred_glr)
+
+# 2. BIC Calculation
+n = pred_glr.count()
+k = len(lr_model.coefficients)
+rss = pred_glr.select(pow(col("SALARY") - col("prediction"), 2).alias("squared_error")) \
+              .agg({"squared_error": "sum"}).collect()[0][0]
+bic = n * np.log(rss / n) + k * np.log(n)
+
+# 3. RMSE (manual)
+rmse = np.sqrt(rss / n)
+
+# 4. Print Evaluation Summary
+print("\n--- Model Evaluation on SALARY ---")
+print(f"R²     : {r2:.4f}")
+print(f"RMSE   : {rmse:.4f}")
+print(f"MAE:  {mae:.2f}")
+
+```
+
+## Model Evaluation Plot
+
+- Display the predicted vs actual salary plot with a red line indicating the ideal fit (y=x).
+- Use `seaborn` or `matplotlib` to create the plot.
+- Customize the plot with appropriate titles, labels, and legends.
+- Describe the plot in a few sentences, highlighting key insights and observations.
+
+```{python}
+#| eval: true
+#| echo: true
+#| fig-align: center
+
+
+# 1) pull predictions into pandas
+pandas_df = pred_glr.select("prediction","SALARY").toPandas()
+
+# 2) assign directly—no expm1
+pandas_df["actual_salary"]    = pandas_df["SALARY"]
+pandas_df["predicted_salary"] = pandas_df["prediction"]
+
+# 3) sanity‐check finite values
+print(pandas_df[["actual_salary","predicted_salary"]].describe())
+
+```
+
+```{python}
+#| eval: true
+#| echo: true
+#| fig-align: center
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+
+plt.figure(figsize=(10,5))
+sns.scatterplot(
+    x="actual_salary",
+    y="predicted_salary",
+    data=pandas_df,
+    alpha=0.6,
+    edgecolor=None
+)
+
+
+lims = [
+    pandas_df.actual_salary.min(),
+    pandas_df.actual_salary.max()
+]
+plt.plot(lims, lims, "--", color="red", label="Ideal fit")
+
+
+plt.xlabel("Actual Salary", fontsize=12)
+plt.ylabel("Predicted Salary", fontsize=12)
+plt.title(
+    f"Predicted vs Actual Salary (GLR Model)\n"
+    f"RMSE = {rmse:.2f} | R² = {r2:.3f} | BIC = {bic:.2f}",
+    loc="left",
+    fontsize=14,
+    fontweight="bold"
+)
+plt.legend()
+plt.tight_layout()
+plt.show()
+```
+
+- The scatter of points hugs the **45° “ideal fit”** line most tightly in the **mid‐salary range (≈$80 k–$160 k)**, showing the model does reasonably well at predicting average salaries.
+
+- We can see classic regression‐to‐the‐mean:**high earners (≥$200 k) tend to be under‐predicted**, and **lower earners (≤$80 k) slightly over‐predicted**.
+
+- The cloud’s vertical spread grows at the extremes, indicating larger absolute errors for the highest and lowest salaries.
+
+- **Overall, this GLR baseline captures central trends but struggles on the tails—consider non‐linear terms or tree‐based models if you need tighter accuracy outside the core range.**
+
+# Resources {.unnumbered}
+- [PySpark MLlib Docs](https://spark.apache.org/docs/latest/ml-guide.html)  
+- [Seaborn Docs](https://seaborn.pydata.org/)  
+- [Pandas User Guide](https://pandas.pydata.org/docs/user_guide/index.html)
+
